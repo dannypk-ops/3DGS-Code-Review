@@ -152,8 +152,18 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
+// GeometryState 구조체의 멤벼 변수들에 대해서 필요한 메모리를 할당해 주는 함수
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
+	/*
+	template <typename T>
+	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
+	{
+		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
+		ptr = reinterpret_cast<T*>(offset);re
+		chunk = reinterpret_cast<char*>(ptr + count);
+	}
+	*/
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
@@ -163,6 +173,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
+	// InclusiveSum에 필요한 임시 버퍼 ( geom.scan_size의 크기 )를 계산하기 위해서 호출
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
@@ -221,23 +232,28 @@ int CudaRasterizer::Rasterizer::forward(
 	int* radii,
 	bool debug)
 {
+	// Fov로부터 focal length를 연산. ( intrinsic )
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	// GeometryState는 rasterizer_impl.h에 정의되어 있는 구조체
+	// 각 Gaussians들의 정보들이 정의
+	size_t chunk_size = required<GeometryState>(P);	// GeomteryState의 size를 연산
+	char* chunkptr = geometryBuffer(chunk_size);	// size를 바탕으로, 외부에서 정의한 GeometryBuffer의 크기를 수정해 주는 함수 호출
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);	// point의 갯수만큼 chunk를 갖는 Buffer 생성 ( chunkptr 메모리 할당 )
 
-	if (radii == nullptr)
+	if (radii == nullptr)	// False
 	{
 		radii = geomState.internal_radii;
 	}
-
+	
+	// config.h에 BLOCK_X , BLOCK_Y = 16으로 정의
+	// width, height의 정보를 이용해서 (16 * 16) tile의 인덱스를 생성
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Dynamically resize image-based auxiliary buffers during training
-	size_t img_chunk_size = required<ImageState>(width * height);
+	size_t img_chunk_size = required<ImageState>(width * height);	// geomstate와 동일하게 메모리 할당
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
@@ -247,6 +263,8 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	// render하기에 앞서, 각 Gaussian들의 정보들을 preprocessing 하는 함수
+	// 각 Gaussian의 2D Covariance, radii, color, tile_touched 등을 결정하는 함수이다.
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,

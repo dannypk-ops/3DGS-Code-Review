@@ -66,8 +66,9 @@ RasterizeGaussiansCUDA(
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
+  // torch::full = 모든 원소가 동일한 값으로 채워진 tensor를 생성하는 함수이다.
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_invdepth = torch::full({0, H, W}, 0.0, float_opts);
+  torch::Tensor out_invdepth = torch::full({0, H, W}, 0.0, float_opts);		// 무시되는 Code
   float* out_invdepthptr = nullptr;
 
   out_invdepth = torch::full({1, H, W}, 0.0, float_opts).contiguous();
@@ -80,6 +81,17 @@ RasterizeGaussiansCUDA(
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  /*
+  std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+    auto lambda = [&t](size_t N) {
+        t.resize_({(long long)N});
+		return reinterpret_cast<char*>(t.contiguous().data_ptr());
+    };
+    return lambda;
+	}
+  */
+  // Buffer들의 참조를 이용하는 함수로, 호출하게 되면 참조의 Buffer의 크기를 바꾸어 주는 역할을 수행해 준다.
+  // 함수의 외부에서, Buffer가 필요할 때, 함수를 호출함으로써 동적 할당 등에 이용 가능.
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
@@ -90,9 +102,11 @@ RasterizeGaussiansCUDA(
 	  int M = 0;
 	  if(sh.size(0) != 0)
 	  {
-		M = sh.size(1);
+		M = sh.size(1);	// M = 16
       }
-
+	  
+	  // rasterizer_impl.cu에 정의되어 있다.
+	  // rasterizer.h에 선언되어 있고, 이는 rasterizer_impl.h에서 링킹이 된다.
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
 		binningFunc,

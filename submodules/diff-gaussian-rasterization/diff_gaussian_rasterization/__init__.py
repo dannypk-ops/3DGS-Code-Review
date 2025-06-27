@@ -12,7 +12,7 @@
 from typing import NamedTuple
 import torch.nn as nn
 import torch
-from . import _C
+from . import _C    # 보통 C++/CUDA로 작성된 확장 모듈을 Pybinding한 것을 의미한다. ( ext.cpp 에서 확인 가능 )
 
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
@@ -29,6 +29,8 @@ def rasterize_gaussians(
     cov3Ds_precomp,
     raster_settings,
 ):
+    # apply()는 torch.autograd.Function을 상속받은 class를 대상으로
+    # forward와 backward를 연결해 주는 정적 메소드이다. ( pytorch에서 gradient를 추적할 수 있다. )
     return _RasterizeGaussians.apply(
         means3D,
         means2D,
@@ -41,10 +43,12 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+# C++/CUDA로 구현된 커스텀 연산을 Pytorch의 미분 그래프에 포함시키기 위해서,
+#  "torch.autograd.Function"를 상속받고 forward와 backward를 직접 정의한다.
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx,
+        ctx,    # forward와 backward 사이의 데이터를 공유하기 위한 특별한 객체이다. ( 따로 tensor를 만들어 줄 필요없이, 자동으로 생성 )
         means3D,
         means2D,
         sh,
@@ -175,7 +179,7 @@ class GaussianRasterizer(nn.Module):
         
         raster_settings = self.raster_settings
 
-        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):   
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
         
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):

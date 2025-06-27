@@ -89,6 +89,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
+        # exposure과 position의 leraning rate deacy 전략때문에 호출
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree

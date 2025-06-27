@@ -22,6 +22,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     Background tensor (bg_color) must be on GPU!
     """
  
+    # scrrenspace_points는 depth(Z)가 1인 Regularized Cmaera Coordinate를 의미하는 것.
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -61,7 +62,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations = None
     cov3D_precomp = None
 
-    if pipe.compute_cov3D_python:
+    if pipe.compute_cov3D_python:   # False
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
@@ -72,14 +73,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     shs = None
     colors_precomp = None
     if override_color is None:
-        if pipe.convert_SHs_python:
+        if pipe.convert_SHs_python: # False
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            if separate_sh:
+            if separate_sh: # False
                 dc, shs = pc.get_features_dc, pc.get_features_rest
             else:
                 shs = pc.get_features

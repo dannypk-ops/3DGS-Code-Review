@@ -202,6 +202,7 @@ class GaussianModel:
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
+        # We use a standard exponential decay scheduling technique similar to Plenoxels [Fridovich-Keil and Yu et al. 2022], but for positions only.
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,

@@ -21,9 +21,11 @@ namespace CudaRasterizer
 	template <typename T>
 	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
 	{
+		// 메모리 구조에 맞게 chunk의 메모리 주소를 alignemnt의 배수가 되게끔 설정해 주는 과정
+		// & ~ (alignment - 1)은 alignemnt 아래의 bit를 모두 내림하는 효과를 갖는다. ( 2의 보수를 and 연산하는 것 )
 		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
 		ptr = reinterpret_cast<T*>(offset);
-		chunk = reinterpret_cast<char*>(ptr + count);
+		chunk = reinterpret_cast<char*>(ptr + count);	// chunk를 count 만큼 이동하여 업데이트한다.
 	}
 
 	struct GeometryState

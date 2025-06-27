@@ -86,11 +86,14 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
+	// paper에서 소개하는 Jacobian의 수식 구현 부분이다.
+	// paper와 다르게, focal_length 값들이 이용되어 구현이 되어 있는 것을 확인할 수 있다.
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// paper에서 소개하는 viewmatrix의 구현 부분이다.
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
@@ -98,6 +101,7 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 
 	glm::mat3 T = W * J;
 
+	// 대칭 행렬의 특성을 이용하여 cov3D를 구현
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
@@ -105,6 +109,7 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
+	// COV3D와 동일한 논리로, 대칭행렬(2 by 2)이기 때문에 upper triangle만을 유지한다.
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
@@ -148,7 +153,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 }
 
 // Perform initial steps for each Gaussian prior to rasterization.
-template<int C>
+template<int C>		// C = 3
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
 	const glm::vec3* scales,
@@ -176,21 +181,24 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	bool prefiltered,
 	bool antialiasing)
 {
+	// 전체 grid에서의 현재 thread의 index를 의미한다.
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
-	radii[idx] = 0;
-	tiles_touched[idx] = 0;
+	radii[idx] = 0;		// Gaussians의 투영되었을 때의 길이를 의미한다. ( 0으로 초기화 )
+	tiles_touched[idx] = 0;	// Gaussian이 touch한 tile의 수를 의미한다. ( 0으로 초기화 )
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
+	// Gaussian이 현재 frustum에 포함되지 않는다면, preprocessing 진행 X ( frustum culling )
+	// in_frustum( )은 auxiliary.h에 정의되어 있다.
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
-	// Transform point by projecting
+	// Transform point by projecting ( World to Camera )
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
@@ -199,19 +207,23 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
 	const float* cov3D;
-	if (cov3D_precomp != nullptr)
+	if (cov3D_precomp != nullptr)	// False
 	{
 		cov3D = cov3D_precomp + idx * 6;
 	}
 	else
 	{
+		// python에 있는 cov3D를 생성하는 방법과 완전히 동일하다. ( 대칭행렬이므로, upper triangle만 저장 )
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
 
 	// Compute 2D screen-space covariance matrix
+	// paper에 소개되어 있는 2D Gaussian의 covariance를 구하는 과정이다.
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
+	// 정확한 이해 X
+	// anti-aliasing의 구현 과정에 필요한 부분으로 추정
 	constexpr float h_var = 0.3f;
 	const float det_cov = cov.x * cov.z - cov.y * cov.y;
 	cov.x += h_var;
@@ -225,28 +237,35 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Invert covariance (EWA algorithm)
 	const float det = det_cov_plus_h_cov;
 
+	// 2D covariance의 determinant가 0이면 무시 ( 정의 X )
 	if (det == 0.0f)
 		return;
 	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };	// 2D Gaussian의 공분산 행렬을 conic form(이차 곡선 계수)로 변환
 
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
 	float mid = 0.5f * (cov.x + cov.z);
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));	// 2D COV의 고유값을 구하는 공식 적용 1
+	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));	// 2D COV의 고유값을 구하는 공식 적용 2
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));	// 2D Covariance의 고유값은 분산(Var)을 의미하므로, 3 * std를 의미하게 된다 ( confidence 99.7%)
+	/*
+	__forceinline__ __device__ float ndc2Pix(float v, int S)
+	{	
+		return ((v + 1.0) * S - 1.0) * 0.5;
+	}
+	*/
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };	// image에서의 좌표값으로 변환
 	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
-	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+	getRect(point_image, my_radius, rect_min, rect_max, grid);		// 해당 point의 중심으로부터 max_radius만큼의 사각형을 생성하여, touch하는 grid의 index를 생성 ( rect_min, rect_max )
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)	// min과 max가 동일하다면, 즉 겹치는 타일이 존재하지 않는다면 무시
 		return;
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
-	if (colors_precomp == nullptr)
+	if (colors_precomp == nullptr)	// True
 	{
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		rgb[idx * C + 0] = result.x;
@@ -256,7 +275,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
-	radii[idx] = my_radius;
+	radii[idx] = my_radius;		// 2D Gaussian의 radius는 max radius로 설정
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	float opacity = opacities[idx];
@@ -453,6 +472,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	bool prefiltered,
 	bool antialiasing)
 {
+	// simple-knn에서와 동일하게 256 크기의 block을 단위로 나누어서 preprocessCUDA를 병렬적으로 실행
+	// ( NUM_CHANNELS는 config.h에 3으로 정의되어 있다. ) 
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,
