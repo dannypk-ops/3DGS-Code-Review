@@ -77,6 +77,7 @@ __global__ void duplicateWithKeys(
 	int* radii,
 	dim3 grid)
 {
+	// 전체 grid에서 현재 thread의 idx 반환
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
@@ -85,9 +86,10 @@ __global__ void duplicateWithKeys(
 	if (radii[idx] > 0)
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
-		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];	// 현재 thread가 담당하는 Gaussian의 offset(영향을 준 tile의 갯수)를 저장
 		uint2 rect_min, rect_max;
 
+		// // 해당 point의 중심으로부터 max_radius만큼의 사각형을 생성하여, touch하는 grid의 index를 생성 ( rect_min, rect_max )
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
@@ -99,12 +101,13 @@ __global__ void duplicateWithKeys(
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
+				uint64_t key = y * grid.x + x;	// touch한 grid의 index
+				key <<= 32;		// key(tile ID)를 32bit(4byte = INT)만큼 left shift 연산
+				key |= *((uint32_t*)&depths[idx]);	// depth의 정보를 OR 연산을 통해 key에 입력
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
 				off++;
+				// 누적합으로 생성하였던 offset은 다음과 같이 key : value의 index를 표현하기 위해 이용!
 			}
 		}
 	}
@@ -115,15 +118,23 @@ __global__ void duplicateWithKeys(
 // Run once per instanced (duplicated) Gaussian ID.
 __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
 {
+	// 현재 thread의 index를 가리킨다.
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= L)
 		return;
 
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
-	uint32_t currtile = key >> 32;
+	uint32_t currtile = key >> 32;		// right shift연산, tile grid 정보값만이 남게 된다.
+
+	// 만약 첫 Gaussian(idx == 0)이거나 또는 마지막 Gaussian(idx = L-1)인 경우에는 위치가 고정 ( 정렬된 결과이기 때문 )
+	// 첫번째 Gaussian은 첫번째 grid의 시작 Gaussian
+	// 마지막 Gaussian은 마지막 grid의 마지막 Gaussian
 	if (idx == 0)
 		ranges[currtile].x = 0;
+	// 중간 Gaussian들에 대해서는 이전 Gaussian과의 관계를 통해서 결정해야 한다.
+	// 바로 이전의 Gaussian이 속하는 tile의 정보와 다르다면, 각 Gaussian이 tile의 경계를 가리키는 Gaussian이기 때문에
+	// 다음과 같이 값을 설정해 줄 수 있다.
 	else
 	{
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
@@ -295,18 +306,24 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	// 각 Gaussian이 결과 배열에서 데이터를 사용할 시작 위치(offset)을 구하는데 이용이 된다.
+	// geomState.point_offsets에 누적합의 결과가 반환된다.
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+	// num_rendered = 전체 Gaussian들이 영향을 미치는 tile의 총 갯수를 의미한다.
+	// 누적합이기 때문에, 가장 마지막 List의 값이 전체 tile의 총 갯수를 의미하게 된다.
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
-	size_t binning_chunk_size = required<BinningState>(num_rendered);
-	char* binning_chunkptr = binningBuffer(binning_chunk_size);
-	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+	size_t binning_chunk_size = required<BinningState>(num_rendered);	// BinningState가 num_rendered개 데이터를 처리할 때 필요한 메모리 크기를 계산
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);		// binning_chunk_size만큼 GPU 메모리를 할당하고 시작 주소를 반환
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);	// 할당된 메모리에서 BinningState 멤버들을 num_rendered개에 맞게 초기화
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
+	// paper에 나왔던 그대로 { [ tile | depth ] : Gaussian ID } 형태의 dictionary를 생성
+	// ( binningState.point_list_keys_unsorted, binningState.point_list_unsorte에 저장 )
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -318,19 +335,26 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid)
 	CHECK_CUDA(, debug)
 
+	// getHigherMsb = CPU에서 32비트 정수 중 가장 높은 1비트의 위치를 찾는 helper 함수이다.
+	// 즉 이는 tile ID를 표현하는데 필요한 최소 비트 수를 의미한다.
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
+	// 결국 정렬된 list들은 tileID 별로 우선 정렬이 된 이후에
+	// depth가 낮은것부터 정렬되어 
+	// 결과적으로는 tile별 depth 정보가 담겨있는 list가 반환되게 된다. ( 오름차순 )
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit), debug)	// 32 + bit는 RadixSort에서 정렬할 키의 총 비트 수를 의미한다. ( for memory efficiency )
 
+	// tile_grid.x * tile_grid_y * sizeof(uint2) 크기 만큼의 memory를 0으로 초기화하여 메모리 할당
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
+	// 각 tile 별로 시작 Gaussian의 idx와 마지막 Gaussian idx의 정보를 담는 자료구조를 생성 ( imgState.ranges )
 	if (num_rendered > 0)
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,
@@ -339,6 +363,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	// Let each tile blend its range of Gaussians independently in parallel
+	// geomState.rgb는 preprocess 과정에서 SH를 RGB의 형태로 변환하여 생성이 되는 값이다.
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,

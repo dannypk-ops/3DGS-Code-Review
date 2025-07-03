@@ -292,6 +292,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // and rasterizing data.
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+// __restrict 표현은 Compiler에게 각 변수들의 메모리가 겹치지 않는다는 것을 알려주는 역할이다.
+// 이는 register의 사용 최적화를 통해 GPU의 연산 최적화가 가능해 진다.
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -307,21 +309,33 @@ renderCUDA(
 	float* __restrict__ invdepth)
 {
 	// Identify current tile and associated min/max pixel range.
-	auto block = cg::this_thread_block();
-	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	auto block = cg::this_thread_block();	// 현재 thread가 속하는 block의 인덱스
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;	// 전체 tile의 가로 갯수
+
+	// block.group_index는 전체 grid에서의 현재 block의 위치를 의미한다.
+	// pix_min : 현재 tile의 시작 pixel 인덱스
+	// pix_max : 현재 tile의 마지막 pixel 인덱스
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };	
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	uint32_t pix_id = W * pix.y + pix.x;
+
+	// 현재 Gaussian이 영향을 주는 pixel의 위치
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };	
+	uint32_t pix_id = W * pix.y + pix.x;	// pixel의 위치를 flatten된 형태로 제공 ( 1D )
 	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
+	// Width, Height 내에 포함되지 않는 pixel을 다루는 thread는 바로 done을 True로 설정한다. ( line:359 )
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	// 현재 thread가 속하는 tile의 시작과 끝을 담당하는 Gaussian의 ID를 저장 ( range )
+	// #define BLOCK_SIZE (BLOCK_X * BLOCK_Y) -> 256
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];	
+
+	// range.y - range.x (toDo)는 현재 tile에 영향을 주는 Gaussian들의 전체 갯수를 의미하고
+	// 이유는 잘 모르겠으나, 256개씩의 Gaussian들로 나누어서 batch 단위로 연산을 진행하는것 같다.
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
@@ -334,7 +348,7 @@ renderCUDA(
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
-	float C[CHANNELS] = { 0 };
+	float C[CHANNELS] = { 0 };		// CHANNELS = 3
 
 	float expected_invdepth = 0.0f;
 
@@ -342,20 +356,26 @@ renderCUDA(
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
 		// End if entire block votes that it is done rasterizing
+		// batch 단위로 빠르게 연산하기 위해 도입
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;
 
 		// Collectively fetch per-Gaussian data from global to shared
-		int progress = i * BLOCK_SIZE + block.thread_rank();
+		// batch 단위로 한번에 연산하기 위해서, 256개의 Data를 공유 메모리에 올리는 과정
+		// progress 는 현재 tile에서 처리해야하는 Gaussian중 어디를 담당하고 있는지를 의미하는 변수
+		// i * BLOCK_SIZE : 지금까지 처리한 Gaussian의 수
+		// block.thread_rank() : 현재 batch에서 몇번째 Gaussian을 사용하고 있는지
+		// 물론 현재 thread는 256개의 pixel 정보중 하나를 가리키긴 하지만, batch size와 동일하기 때문에, 위처럼 이용이 가능하다!
+		int progress = i * BLOCK_SIZE + block.thread_rank();	
 		if (range.x + progress < range.y)
 		{
 			int coll_id = point_list[range.x + progress];
-			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_id[block.thread_rank()] = coll_id;	//Gaussian의 ID 저장
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];	// Gaussian의 2D Image에서의 위치 저장
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];	// Gaussian의 Conic Opacity 저장
 		}
-		block.sync();
+		block.sync();	// 256개의 batch가 모두 생성이 될때까지 대기 ( 동기화 )
 
 		// Iterate over current batch
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
@@ -365,6 +385,9 @@ renderCUDA(
 
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
+			// 픽셀값과 Gaussian이 투영된 픽셀의 사이의 Mahalanobis Distance를 이용하여
+			// 현재 pixel에 Gaussian이 영향을 주는 지에 대한 여부를 판단하는 로직이다.
+			// Power는 Gaussian의 지수항을 의미한다.
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
@@ -377,8 +400,13 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+
+			// alpha가 너무 작은 경우, 불안정하기 때문에 blending 과정에 포함 X
+			if (alpha < 1.0f / 255.0f) 
 				continue;
+
+			// blending하기 전, 다음 Gaussian을 포함한 결과를 미리 확인하여
+			// T값이 0.0001보다 작다면, 즉 누적 opacity값이 0.9999보다 크다면 STOP
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -397,18 +425,20 @@ renderCUDA(
 
 			// Keep track of last range entry to update this
 			// pixel.
+			// 해당 pixel을 결정하는 마지막 Gaussian을 backward에서 구분하기 위하여 이용된다.
 			last_contributor = contributor;
 		}
 	}
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
+	// Pixel의 최종 반환값을 생성해 주는 과정.
 	if (inside)
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];		// BG Color도 함께 반영
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
@@ -429,8 +459,12 @@ void FORWARD::render(
 	float* out_color,
 	float* depths,
 	float* depth)
-{
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+{	
+	// NUM_CHANNELS = 3
+	// grid : 전체 tile의 갯수를 의미한다
+	// block은 각 tile의 pixel 갯수를 의미한다. ( 16 * 16 )
+	// 결국 이 코드는 각 tile별로 pixel 갯수만큼의 thread를 생성시키는 병렬 코드이다.
+	renderCUDA<NUM_CHANNELS> <<<grid, block >>> (
 		ranges,
 		point_list,
 		W, H,
